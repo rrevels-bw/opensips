@@ -47,11 +47,18 @@
  */
 long connection_timeout = 20; /* s */
 long connect_poll_interval = 20; /* ms */
-long connection_timeout_ms;
+long connection_timeout_ms = 0;
 int max_async_transfers = 100;
 long curl_timeout = 20;
 char *ssl_capath;
 unsigned int max_transfer_size = 10240; /* KB (10MB) */
+
+/*
+   in the end there will be two timeouts.  one for rest connect.
+   one for curl timeout.  these will be based on the smallest of
+   curl or async timeout for transfer and connect or curl or async
+   timeout for connect
+*/
 
 /*
  * curl_multi_perform() may indicate a "try again" response even
@@ -194,6 +201,7 @@ static const trans_export_t trans[] = {
  */
 static const param_export_t params[] = {
 	{ "connection_timeout",	INT_PARAM, &connection_timeout	},
+	{ "connection_timeout_ms",	INT_PARAM, &connection_timeout_ms	},
 	{ "connect_poll_interval", INT_PARAM, &connect_poll_interval },
 	{ "max_async_transfers", INT_PARAM, &max_async_transfers },
 	{ "max_transfer_size",	INT_PARAM, &max_transfer_size	},
@@ -207,7 +215,6 @@ static const param_export_t params[] = {
 	{ "curl_conn_lifetime",	INT_PARAM, &curl_conn_lifetime	},
 	{ 0, 0, 0 }
 };
-
 
 /*
  * Module parameter variables
@@ -239,8 +246,21 @@ static int mod_init(void)
 {
 	LM_DBG("Initializing...\n");
 
-	connection_timeout_ms = connection_timeout * 1000L;
-	_async_resume_retr_timeout = curl_timeout * 1000000U;
+	connection_timeout = connection_timeout * 1000L;
+	if( connection_timeout_ms > 0 )
+	{
+		//connection timout specified in ms in config
+		//set connection timeout and connection timeout ms to same value
+		connection_timeout = connection_timeout_ms;
+	}
+	else
+	{
+		connection_timeout_ms = connection_timeout;
+	}
+
+	curl_timeout = curl_timeout * 1000L;
+
+	_async_resume_retr_timeout = curl_timeout * 1000U;
 
 	if (connect_poll_interval < 0) {
 		LM_ERR("Bad connect_poll_interval (%ldms), setting to 20ms\n",
@@ -248,10 +268,10 @@ static int mod_init(void)
 		connect_poll_interval = 20;
 	}
 
-	if (connection_timeout > curl_timeout) {
-		LM_WARN("'connection_timeout' must be less than or equal "
-		        "to 'curl_timeout'! setting it to %ld...\n", curl_timeout);
-		connection_timeout = curl_timeout;
+	if (connection_timeout_ms > curl_timeout) {
+			LM_WARN("'connection_timeout' must be less than or equal "
+					"to 'curl_timeout'! setting it to %ld...\n", curl_timeout);
+			connection_timeout_ms = curl_timeout;
 	}
 
 	if (rcl_init_internals() != 0) {
@@ -615,8 +635,16 @@ int async_rest_method(enum rest_client_method method, struct sip_msg *msg,
 	if (no_concurrent_connects && (lrc=rcl_acquire_url(url, &host)) < RCL_OK)
 		return lrc;
 
-	param->timeout_s = (ctx->timeout_s && ctx->timeout_s < curl_timeout) ?
-			ctx->timeout_s : curl_timeout;
+	param->timeout_s = (ctx->timeout_s && (ctx->timeout_s * 1000L) < curl_timeout) ?
+			ctx->timeout_s * 1000L : curl_timeout;
+
+	/* above i converted everything to milliseconds but
+	   async only works with seconds so... */
+
+	if ( param->timeout_s <= 1000L )
+		ctx->timeout_s = 1;
+	else
+		ctx->timeout_s = param->timeout_s * .001;
 
 	rc = start_async_http_req(msg, method, url, body, ctype,
 			param, &param->body, ctype_pv ? &param->ctype : NULL, &read_fd);
@@ -685,7 +713,8 @@ int async_rest_method(enum rest_client_method method, struct sip_msg *msg,
 
 	ctx->resume_f = resume_async_http_req;
 	ctx->timeout_f = time_out_async_http_req;
-	ctx->timeout_s = param->timeout_s;
+
+   LM_DBG("shoving request into async with timeout %d s for call '%.*s'\n", ctx->timeout_s, msg->callid->body.len, msg->callid->body.s);
 
 	param->method = method;
 	param->body_pv = (pv_spec_p)body_pv;

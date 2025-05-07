@@ -414,14 +414,20 @@ static int init_transfer(CURL *handle, char *url, unsigned long timeout_s)
 		tls_dom = NULL;
 	}
 
-	w_curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT,
-			timeout_s && timeout_s < connection_timeout ? timeout_s : connection_timeout);
-	w_curl_easy_setopt(handle, CURLOPT_TIMEOUT,
-			timeout_s && timeout_s < curl_timeout ? timeout_s : curl_timeout);
+	/*
+	*  think these timeouts may be broke for sync transfers as the function is called with zero
+	*  "Set this option to zero to switch to the default built-in connection timeout - 300 seconds."
+	*/
+	w_curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
+			timeout_s && timeout_s < connection_timeout_ms ? timeout_s : connection_timeout_ms);
 
 	w_curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
 	w_curl_easy_setopt(handle, CURLOPT_STDERR, stdout);
 	w_curl_easy_setopt(handle, CURLOPT_FAILONERROR, 0);
+	w_curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, 15);
+
+	w_curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS,
+		timeout_s && timeout_s < curl_timeout ? timeout_s : curl_timeout);
 
 	if (ssl_capath)
 		w_curl_easy_setopt(handle, CURLOPT_CAPATH, ssl_capath);
@@ -665,11 +671,11 @@ static inline char rest_easy_perform(
 	case CURLE_OPERATION_TIMEDOUT:
 		curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect_time);
 		if (connect_time == 0) {
-			LM_ERR("connect timeout on %s (%lds)\n", url, connection_timeout);
+			LM_ERR("connect timeout in rest easy perform on %s (%ldms)\n", url, connection_timeout_ms);
 			return RCL_CONNECT_TIMEOUT;
 		}
 
-		LM_ERR("connected, but transfer timed out for %s (%lds)\n",
+		LM_ERR("connected, but transfer timed out for %s (%ldms)\n",
 		       url, curl_timeout);
 		return RCL_TRANSFER_TIMEOUT;
 
@@ -893,13 +899,14 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 	connect_timeout = (async_parm->timeout_s*1000) < connection_timeout_ms ?
 			(async_parm->timeout_s*1000) : connection_timeout_ms;
-	timeout = connect_timeout;
+
 	busy_wait = connect_poll_interval;
 
-	/* obtain a read fd in "connection_timeout" seconds at worst */
+	/* obtain a read fd in "connection_timeout" milliseconds at worst */
 	for (timeout = connect_timeout; timeout > 0; timeout -= busy_wait) {
 		double connect = -1;
 		long req_sz = -1;
+		curl_off_t pretransfer;
 
 		mrc = curl_multi_perform(multi_handle, &running_handles);
 		if (mrc != CURLM_OK && mrc != CURLM_CALL_MULTI_PERFORM) {
@@ -909,9 +916,9 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 		curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect);
 		curl_easy_getinfo(handle, CURLINFO_REQUEST_SIZE, &req_sz);
-
-		LM_DBG("perform code: %d, handles: %d, connect: %.3lfs, reqsz: %ldB\n",
-		        mrc, running_handles, connect, req_sz);
+		curl_easy_getinfo(handle, CURLINFO_PRETRANSFER_TIME_T, &pretransfer);
+		LM_DBG("perform code: %d, handles: %d, connect: %.3lfs, reqsz: %ldB Time: %" CURL_FORMAT_CURL_OFF_T ".%06ld\n",
+		        mrc, running_handles, connect, req_sz,pretransfer / 1000000,(long)(pretransfer % 1000000) );
 
 		/* transfer completed!  But how well? */
 		if (running_handles == 0) {
@@ -934,7 +941,8 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 			case CURLE_OPERATION_TIMEDOUT:
 				if (http_rc == 0) {
-					LM_ERR("connect timeout on %s (%ldms)\n", url,
+					//changing to debug so we dont blow up the logs if webserver goes away
+					LM_DBG("connect timeout in loop in start async on %s (%ldms)\n", url,
 							connect_timeout);
 					ret = RCL_CONNECT_TIMEOUT;
 					goto error;
@@ -973,9 +981,10 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 		if (max_fd != -1) {
 			for (fd = 0; fd <= max_fd; fd++) {
 				if (FD_ISSET(fd, &rset)) {
-					LM_DBG("ongoing transfer on fd %d\n", fd);
-					if (connect > 0 && req_sz > 0 && is_new_transfer(fd)) {
-						LM_DBG(">>> add fd %d to ongoing transfers\n", fd);
+					LM_DBG("ongoing transfer on fd %d with connect: %.3lfs and reqsz: %ldB "
+						   "and running handles: %d \n", fd, connect, req_sz, running_handles );
+					if (req_sz > 0 && is_new_transfer(fd)) {
+						LM_DBG("adding fd %d to ongoing transfers after getting request size: %ldB and running handles %d for call '%.*s' \n", fd, req_sz, running_handles, msg->callid->body.len, msg->callid->body.s);
 						add_transfer(fd);
 						goto success;
 					}
@@ -985,14 +994,11 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 		mrc = curl_multi_timeout(multi_handle, &retry_time);
 		if (mrc != CURLM_OK) {
-			LM_ERR("curl_multi_timeout: %s\n", curl_multi_strerror(mrc));
+			LM_ERR("curl_multi_timeout: %s in start async loop after asking how much time to wait\n", curl_multi_strerror(mrc));
 			goto error;
 		}
 
-		LM_DBG("libcurl TCP connect: we should wait up to %ldms "
-		       "(timeout=%ldms, poll=%ldms)!\n", retry_time,
-		       connect_timeout, connect_poll_interval);
-
+		LM_DBG("libcurl TCP connect: we should wait up to %ldms for retry time (loop timeout=%ldms, poll=%ldms) for call '%.*s' !\n", retry_time, timeout, connect_poll_interval, msg->callid->body.len, msg->callid->body.s);
 		/*
 			from curl_multi_timeout() docs:
 				retry_time = -1, no timeout set
@@ -1007,12 +1013,13 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 		if (busy_wait > 0) {
 			/* libcurl seems to be stuck in internal operations (TCP connect?) */
-			LM_DBG("busy waiting %ldms ...\n", busy_wait);
+			LM_DBG("busy waiting %ldms for call '%.*s' \n", busy_wait, msg->callid->body.len, msg->callid->body.s);
 			usleep(1000UL * busy_wait);
 		}
 	}
 
-	LM_ERR("connect timeout on %s (%lds)\n", url, connection_timeout);
+	//this line can be used for troubleshooting why we get here later as it has the sip call-id in it now which would also be in any http requests sent out.
+	//LM_ERR("connect timeout in async at bottom after loop on %s (%ldms) for call '%.*s'\n", url, retry_time, msg->callid->body.len, msg->callid->body.s);
 	ret = RCL_CONNECT_TIMEOUT;
 	goto error;
 
@@ -1025,6 +1032,7 @@ success:
 	return RCL_OK;
 
 error:
+	LM_DBG("connect timeout in async at bottom after loop on %s (%ldms) for call '%.*s'\n", url, timeout, msg->callid->body.len, msg->callid->body.s);
 	mrc = curl_multi_remove_handle(multi_handle, handle);
 	if (mrc != CURLM_OK) {
 		LM_ERR("curl_multi_remove_handle: %s\n", curl_multi_strerror(mrc));
@@ -1046,6 +1054,7 @@ cleanup:
 	return ret;
 }
 
+
 static enum async_ret_code _resume_async_http_req(int fd, struct sip_msg *msg,
 										rest_async_param *param, int timed_out)
 {
@@ -1058,17 +1067,27 @@ static enum async_ret_code _resume_async_http_req(int fd, struct sip_msg *msg,
 	int ret = RCL_INTERNAL_ERR, retr;
 	CURLM *multi_handle;
 
-	LM_DBG("resume async processing...\n");
+	LM_DBG("resume async processing for call '%.*s' and timedout set to %d \n", msg->callid->body.len, msg->callid->body.s, timed_out);
 
-	multi_handle = param->multi_list->multi_handle;
+ 	multi_handle = param->multi_list->multi_handle;
 
-	if (timed_out) {
-		char *url = NULL;
-		curl_easy_getinfo(param->handle, CURLINFO_EFFECTIVE_URL, &url);
-		LM_ERR("async %s timed out, URL: %s (timeout: %lds)\n",
-		        rest_client_method_str(param->method), url, param->timeout_s);
-		goto cleanup;
-	}
+ 	if (timed_out) {
+ 		char *url = NULL;
+		double total;
+ 		curl_easy_getinfo(param->handle, CURLINFO_EFFECTIVE_URL, &url);
+		curl_easy_getinfo(param->handle, CURLINFO_TOTAL_TIME, &total);
+		LM_DBG("async %s timed out in resume async, URL: %s (timeout set to: %lds and request went for: %.5f) for call '%.*s' \n",
+		        rest_client_method_str(param->method), url, param->timeout_s, total, msg->callid->body.len, msg->callid->body.s);
+
+		if( total < 1.0L )
+		{
+			/* async has 1 second min. try to recover from some kind of weird timeout that shouldnt have happened */
+			LM_DBG("fd %d still transferring after seeing a timeout from async so continuing for call '%.*s' \n", fd, msg->callid->body.len, msg->callid->body.s );
+			async_status = ASYNC_CONTINUE;
+			return 1;
+		}
+ 		goto cleanup;
+ 	}
 
 	retr = 0;
 	do {
@@ -1170,7 +1189,7 @@ cleanup:
 		goto out;
 
 	case CURLE_OPERATION_TIMEDOUT:
-		LM_ERR("connected, but transfer timed out (%lds)\n", curl_timeout);
+		LM_DBG("connected, but transfer timed out in resume async (%ldms)\n", curl_timeout);
 		ret = RCL_TRANSFER_TIMEOUT;
 		break;
 

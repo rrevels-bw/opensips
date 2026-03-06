@@ -982,7 +982,7 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 				if (FD_ISSET(fd, &rset)) {
 					LM_DBG("ongoing transfer on fd %d with connect: %.3lfs and reqsz: %ldB "
 						   "and running handles: %d \n", fd, connect, req_sz, running_handles );
-					if (req_sz > 0 && is_new_transfer(fd)) {
+					if ((connect > 0 || req_sz > 0) && is_new_transfer(fd)) {
 						LM_DBG("adding fd %d to ongoing transfers after getting request size: %ldB and running handles %d for call '%.*s' \n", fd, req_sz, running_handles, msg->callid->body.len, msg->callid->body.s);
 						add_transfer(fd);
 						goto success;

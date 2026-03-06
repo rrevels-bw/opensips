@@ -405,7 +405,7 @@ static int init_transfer(CURL *handle, char *url, unsigned long timeout_s)
 
 	w_curl_easy_setopt(handle, CURLOPT_URL, url);
 	if (curl_http_version != CURL_HTTP_VERSION_NONE)
-		w_curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, curl_http_version);
+		w_curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, (long)curl_http_version);
 
 	if (tls_dom) {
 		w_curl_easy_setopt(handle, CURLOPT_SSLCERT, tls_dom->cert.s);
@@ -421,9 +421,8 @@ static int init_transfer(CURL *handle, char *url, unsigned long timeout_s)
 	w_curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
 			timeout_s && timeout_s < connection_timeout_ms ? timeout_s : connection_timeout_ms);
 
-	w_curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
-	w_curl_easy_setopt(handle, CURLOPT_STDERR, stdout);
-	w_curl_easy_setopt(handle, CURLOPT_FAILONERROR, 0);
+	w_curl_easy_setopt(handle, CURLOPT_VERBOSE, 0L);
+	w_curl_easy_setopt(handle, CURLOPT_FAILONERROR, 0L);
 	w_curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, 15);
 
 	w_curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS,
@@ -483,7 +482,7 @@ static inline int set_upload_opts(CURL *handle, str *ctype, str *body)
 	 *	   strings (e.g. $du), thus curl's strlen() may overflow or crash
 	 */
 #if (LIBCURL_VERSION_NUM >= 0x071101)
-	w_curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, body->len);
+	w_curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)body->len);
 	w_curl_easy_setopt(handle, CURLOPT_COPYPOSTFIELDS, body->s);
 #else
 	w_curl_easy_setopt(handle, CURLOPT_POSTFIELDS, body->s);
@@ -496,7 +495,7 @@ cleanup:
 
 #define set_post_opts(handle, ctype, body) \
 	do { \
-		w_curl_easy_setopt(handle, CURLOPT_POST, 1); \
+		w_curl_easy_setopt(handle, CURLOPT_POST, 1L); \
 		if (set_upload_opts(handle, ctype, body) != 0) { \
 			LM_ERR("failed to init POST to %s\n", url); \
 			goto cleanup; \
@@ -826,8 +825,8 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 	CURLcode rc;
 	CURLMcode mrc;
 	fd_set rset, wset, eset;
-	int max_fd, fd, http_rc, ret = RCL_INTERNAL_ERR;
-	long busy_wait, timeout, connect_timeout;
+	int max_fd, fd, ret = RCL_INTERNAL_ERR;
+	long http_rc, busy_wait, timeout, connect_timeout;
 	long retry_time;
 	OSS_CURLM *multi_list;
 	CURLM *multi_handle;

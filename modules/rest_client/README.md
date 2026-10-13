@@ -70,7 +70,10 @@ modparam("rest_client", "curl_timeout", 10)
 #### connection_timeout (integer)
 
 
-The maximum allowed time to establish a connection with the server.
+The maximum allowed time to establish a connection with the server, in
+seconds.  For sub-second precision, use
+[connection_timeout_ms](#connection_timeout_ms-integer) instead — if both
+are set, `connection_timeout_ms` takes precedence.
 
 
 *Default value is "20" seconds.*
@@ -79,6 +82,27 @@ The maximum allowed time to establish a connection with the server.
 ```opensips title="Setting the connection_timeout parameter"
 ...
 modparam("rest_client", "connection_timeout", 4)
+...
+```
+
+
+#### connection_timeout_ms (integer)
+
+
+The maximum allowed time to establish a connection with the server, in
+**milliseconds**.  Use this instead of
+[connection_timeout](#connection_timeout-integer) when a sub-second connect
+deadline is required (e.g. fast-fail against a flaky upstream).  If both
+parameters are set, `connection_timeout_ms` takes precedence and
+`connection_timeout` is ignored.
+
+
+*Default value is "0" (disabled; falls back to* `connection_timeout`*).*
+
+
+```opensips title="Setting the connection_timeout_ms parameter"
+...
+modparam("rest_client", "connection_timeout_ms", 285)
 ...
 ```
 
@@ -598,6 +622,30 @@ but in a non-blocking manner.  Script execution is suspended until the
 entire content of the HTTP response is available.
 
 
+**Return Codes**
+
+
+- **1** - Success
+- **-1** - Connection Refused.
+- **-2** - Connection Timeout
+(the [connection_timeout](#connection_timeout-integer) was exceeded
+before a TCP connection could be established)
+- **-3** - Transfer Timeout
+(the [curl_timeout](#curl_timeout-integer) was exceeded before the
+last byte was received)
+- **-4** - Already Connecting
+(another OpenSIPS worker is already connecting to this URL hostname.
+Consult [no_concurrent_connects](#no_concurrent_connects-boolean) for more info).
+- **-5** - Stale Connection
+A reused keep-alive connection from the connection pool was found to be
+dead before any data was sent (e.g. the remote closed it while it was
+idle).  This is distinct from a transfer timeout and is always safe to
+retry — the dead connection is evicted from the pool automatically before
+this code is returned.
+- **-10** - Internal Error (out of
+memory, unexpected libcurl error, etc.)
+
+
 ```opensips title="async rest_get usage"
 route {
 	...
@@ -608,6 +656,12 @@ route {
 route [resume] {
 	$var(rc) = $rc;
 	if ($var(rc) < 0) {
+		if ($var(rc) == -5) {
+			# stale pooled connection — safe to retry immediately
+			async(rest_get("http://getcredit.org/?account=$fU",
+			               $var(credit), , $var(rcode)), resume);
+			exit;
+		}
 		xlog("async rest_get() failed with $var(rc), acc=$fU\n");
 		send_reply(500, "Server Internal Error");
 		exit;
@@ -634,6 +688,28 @@ Script execution is suspended until the entire content of the HTTP
 response is available.
 
 
+**Return Codes**
+
+
+- **1** - Success
+- **-1** - Connection Refused.
+- **-2** - Connection Timeout
+(the [connection_timeout](#connection_timeout-integer) was exceeded
+before a TCP connection could be established)
+- **-3** - Transfer Timeout
+(the [curl_timeout](#curl_timeout-integer) was exceeded before the
+last byte was received)
+- **-4** - Already Connecting
+(another OpenSIPS worker is already connecting to this URL hostname.
+Consult [no_concurrent_connects](#no_concurrent_connects-boolean) for more info).
+- **-5** - Stale Connection
+A reused keep-alive connection from the connection pool was found to be
+dead before any data was sent.  Safe to retry; the dead connection is
+evicted from the pool automatically before this code is returned.
+- **-10** - Internal Error (out of
+memory, unexpected libcurl error, etc.)
+
+
 ```opensips title="async rest_post usage"
 route {
 	...
@@ -644,6 +720,12 @@ route {
 route [resume] {
 	$var(rc) = $rc;
 	if ($var(rc) < 0) {
+		if ($var(rc) == -5) {
+			# stale pooled connection — safe to retry immediately
+			async(rest_post("http://myserver.org/register_user",
+			                $fU, , $var(body), $var(ct), $var(rcode)), resume);
+			exit;
+		}
 		xlog("async rest_post() failed with $var(rc), user=$fU\n");
 		send_reply(500, "Server Internal Error 1");
 		exit;
@@ -669,6 +751,28 @@ Script execution is suspended until the entire content of the HTTP
 response is available.
 
 
+**Return Codes**
+
+
+- **1** - Success
+- **-1** - Connection Refused.
+- **-2** - Connection Timeout
+(the [connection_timeout](#connection_timeout-integer) was exceeded
+before a TCP connection could be established)
+- **-3** - Transfer Timeout
+(the [curl_timeout](#curl_timeout-integer) was exceeded before the
+last byte was received)
+- **-4** - Already Connecting
+(another OpenSIPS worker is already connecting to this URL hostname.
+Consult [no_concurrent_connects](#no_concurrent_connects-boolean) for more info).
+- **-5** - Stale Connection
+A reused keep-alive connection from the connection pool was found to be
+dead before any data was sent.  Safe to retry; the dead connection is
+evicted from the pool automatically before this code is returned.
+- **-10** - Internal Error (out of
+memory, unexpected libcurl error, etc.)
+
+
 ```opensips title="async rest_put usage"
 route {
 	...
@@ -679,6 +783,12 @@ route {
 route [resume] {
 	$var(rc) = $rc;
 	if ($var(rc) < 0) {
+		if ($var(rc) == -5) {
+			# stale pooled connection — safe to retry immediately
+			async(rest_put("http://myserver.org/users/$fU", $var(userinfo), ,
+			               $var(body), $var(ct), $var(rcode)), resume);
+			exit;
+		}
 		xlog("async rest_put() failed with $var(rc), user=$fU\n");
 		send_reply(500, "Server Internal Error 3");
 		exit;

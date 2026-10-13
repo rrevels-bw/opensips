@@ -25,6 +25,8 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
 #include <curl/curl.h>
 
 #include "../../mem/shm_mem.h"
@@ -414,13 +416,25 @@ static int init_transfer(CURL *handle, char *url, unsigned long timeout_s)
 		tls_dom = NULL;
 	}
 
-	w_curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT,
-			timeout_s && timeout_s < connection_timeout ? timeout_s : connection_timeout);
-	w_curl_easy_setopt(handle, CURLOPT_TIMEOUT,
-			timeout_s && timeout_s < curl_timeout ? timeout_s : curl_timeout);
+	/* timeout_s, connection_timeout_ms and curl_timeout are all in milliseconds
+	 * (mod_init converts the second-based params).  A timeout_s of 0 means
+	 * "use the module default"; the && short-circuit never passes 0 to curl. */
+	w_curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
+		timeout_s && (long)timeout_s < connection_timeout_ms ? (long)timeout_s : connection_timeout_ms);
+	w_curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS,
+		timeout_s && (long)timeout_s < curl_timeout ? (long)timeout_s : curl_timeout);
 
 	w_curl_easy_setopt(handle, CURLOPT_VERBOSE, 0L);
 	w_curl_easy_setopt(handle, CURLOPT_FAILONERROR, 0L);
+	w_curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, 240L);
+
+	/* TCP keepalives detect idle pooled connections that the remote has closed.
+	 * Probing starts at 30 s (well under typical server idle timeouts) so a dead
+	 * connection surfaces before the next request writes on it.  With OS-default
+	 * TCP_KEEPCNT=3 a dead connection is declared after 30+3*5=45 s. */
+	w_curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L);
+	w_curl_easy_setopt(handle, CURLOPT_TCP_KEEPIDLE,  30L);
+	w_curl_easy_setopt(handle, CURLOPT_TCP_KEEPINTVL, 5L);
 
 	if (ssl_capath)
 		w_curl_easy_setopt(handle, CURLOPT_CAPATH, ssl_capath);
@@ -664,12 +678,12 @@ static inline char rest_easy_perform(
 	case CURLE_OPERATION_TIMEDOUT:
 		curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect_time);
 		if (connect_time == 0) {
-			LM_ERR("connect timeout on %s (%lds)\n", url, connection_timeout);
+			LM_ERR("connect timeout in rest easy perform on %s (%ldms)\n", url, connection_timeout_ms);
 			return RCL_CONNECT_TIMEOUT;
 		}
 
-		LM_ERR("connected, but transfer timed out for %s (%lds)\n",
-		       url, curl_timeout);
+		LM_ERR("connected, but transfer timed out for %s (%ldms)\n",
+			   url, curl_timeout);
 		return RCL_TRANSFER_TIMEOUT;
 
 	default:
@@ -890,15 +904,17 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 	multi_handle = multi_list->multi_handle;
 	curl_multi_add_handle(multi_handle, handle);
 
-	connect_timeout = (async_parm->timeout_s*1000) < connection_timeout_ms ?
-			(async_parm->timeout_s*1000) : connection_timeout_ms;
-	timeout = connect_timeout;
+	/* async_parm->timeout_s is already in milliseconds */
+	connect_timeout = (long)async_parm->timeout_s < connection_timeout_ms ?
+			(long)async_parm->timeout_s : connection_timeout_ms;
+
 	busy_wait = connect_poll_interval;
 
-	/* obtain a read fd in "connection_timeout" seconds at worst */
+	/* obtain a read fd in "connection_timeout" milliseconds at worst */
 	for (timeout = connect_timeout; timeout > 0; timeout -= busy_wait) {
 		double connect = -1;
 		long req_sz = -1;
+		curl_off_t pretransfer;
 
 		mrc = curl_multi_perform(multi_handle, &running_handles);
 		if (mrc != CURLM_OK && mrc != CURLM_CALL_MULTI_PERFORM) {
@@ -908,9 +924,9 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 		curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect);
 		curl_easy_getinfo(handle, CURLINFO_REQUEST_SIZE, &req_sz);
-
-		LM_DBG("perform code: %d, handles: %d, connect: %.3lfs, reqsz: %ldB\n",
-		        mrc, running_handles, connect, req_sz);
+		curl_easy_getinfo(handle, CURLINFO_PRETRANSFER_TIME_T, &pretransfer);
+		LM_DBG("perform code: %d, handles: %d, connect: %.3lfs, reqsz: %ldB Time: %" CURL_FORMAT_CURL_OFF_T ".%06ld\n",
+		        mrc, running_handles, connect, req_sz,pretransfer / 1000000,(long)(pretransfer % 1000000) );
 
 		/* transfer completed!  But how well? */
 		if (running_handles == 0) {
@@ -933,7 +949,7 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 			case CURLE_OPERATION_TIMEDOUT:
 				if (http_rc == 0) {
-					LM_ERR("connect timeout on %s (%ldms)\n", url,
+					LM_DBG("connect timeout on %s (%ldms)\n", url,
 							connect_timeout);
 					ret = RCL_CONNECT_TIMEOUT;
 					goto error;
@@ -941,6 +957,20 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 				LM_ERR("connected, but transfer timed out for %s\n", url);
 				ret = RCL_TRANSFER_TIMEOUT;
+				goto error;
+
+			case CURLE_GOT_NOTHING:
+			case CURLE_RECV_ERROR:
+			case CURLE_SEND_ERROR:
+				/* keepalive probe or OS detected the connection died while
+				 * it was idle in the pool — same semantics as stale-pool-reuse
+				 * timeout, retryable from script */
+				LM_WARN("pooled connection to %s is dead (curl error %d: %s) "
+				        "for call '%.*s' — retryable\n",
+				        url, rc, curl_easy_strerror(rc),
+				        RCL_CALLID_LEN(msg), RCL_CALLID_S(msg));
+				curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, 1L);
+				ret = RCL_CONN_STALE;
 				goto error;
 
 			default:
@@ -972,9 +1002,53 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 		if (max_fd != -1) {
 			for (fd = 0; fd <= max_fd; fd++) {
 				if (FD_ISSET(fd, &rset)) {
-					LM_DBG("ongoing transfer on fd %d\n", fd);
+					LM_DBG("ongoing transfer on fd %d (connect: %.3lfs, reqsz: %ldB, handles: %d)\n",
+					        fd, connect, req_sz, running_handles);
 					if ((connect > 0 || req_sz > 0) && is_new_transfer(fd)) {
-						LM_DBG(">>> add fd %d to ongoing transfers\n", fd);
+						/* Stale-pool fast-fail probe: applies only to reused pooled
+						 * connections (connect==0 = no new TCP handshake).  A CLOSE_WAIT
+						 * socket has the server's FIN buffered in the kernel receive queue
+						 * — it appears immediately readable before we even check.  Rather
+						 * than handing this fd to the reactor and waiting 1-2 s for the
+						 * coarse timer to fire and clean it up (contributing to the
+						 * reactor backlog under mass-failure conditions), probe now with a
+						 * zero-timeout select + one more curl_multi_perform.  If curl
+						 * completes immediately with an error the connection is dead;
+						 * fail fast without ever registering the fd with the reactor.
+						 * Guard: only act when http_rc==0 so we don't consume curl's
+						 * message queue for a legitimately fast successful response. */
+						if (connect == 0.0) {
+							fd_set p_rset;
+							struct timeval p_zero = {0, 0};
+							int p_running = 0;
+							long p_http_rc = 0;
+							FD_ZERO(&p_rset);
+							FD_SET(fd, &p_rset);
+							if (select(fd + 1, &p_rset, NULL, NULL, &p_zero) == 1) {
+								mrc = curl_multi_perform(multi_handle, &p_running);
+								if (mrc == CURLM_OK && p_running == 0) {
+									curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &p_http_rc);
+									if (p_http_rc == 0) {
+										CURLcode p_rc = CURLE_OK;
+										get_easy_status(handle, multi_handle, &p_rc);
+										LM_DBG("stale-pool fast-fail probe: fd %d immediately "
+										       "readable with no HTTP response, error %d (%s) "
+										       "for call '%.*s' — dead pooled connection evicted "
+										       "before reactor registration\n",
+										       fd, p_rc, curl_easy_strerror(p_rc),
+										       RCL_CALLID_LEN(msg), RCL_CALLID_S(msg));
+										curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, 1L);
+										ret = RCL_CONN_STALE;
+										goto error;
+									}
+									/* p_http_rc > 0: fast response arrived — do not consume
+									 * the message queue; fall through and let the reactor
+									 * handle it via the normal resume path. */
+								}
+							}
+						}
+						LM_DBG("adding fd %d to ongoing transfers (reqsz: %ldB, handles: %d) for call '%.*s'\n",
+						        fd, req_sz, running_handles, RCL_CALLID_LEN(msg), RCL_CALLID_S(msg));
 						add_transfer(fd);
 						goto success;
 					}
@@ -988,10 +1062,8 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 			goto error;
 		}
 
-		LM_DBG("libcurl TCP connect: we should wait up to %ldms "
-		       "(timeout=%ldms, poll=%ldms)!\n", retry_time,
-		       connect_timeout, connect_poll_interval);
-
+		LM_DBG("libcurl TCP connect: retry_time=%ldms, timeout=%ldms, poll=%ldms, call '%.*s'\n",
+		        retry_time, timeout, connect_poll_interval, RCL_CALLID_LEN(msg), RCL_CALLID_S(msg));
 		/*
 			from curl_multi_timeout() docs:
 				retry_time = -1, no timeout set
@@ -1006,12 +1078,11 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 
 		if (busy_wait > 0) {
 			/* libcurl seems to be stuck in internal operations (TCP connect?) */
-			LM_DBG("busy waiting %ldms ...\n", busy_wait);
+			LM_DBG("busy waiting %ldms for call '%.*s'\n", busy_wait, RCL_CALLID_LEN(msg), RCL_CALLID_S(msg));
 			usleep(1000UL * busy_wait);
 		}
 	}
 
-	LM_ERR("connect timeout on %s (%lds)\n", url, connection_timeout);
 	ret = RCL_CONNECT_TIMEOUT;
 	goto error;
 
@@ -1055,17 +1126,97 @@ static enum async_ret_code _resume_async_http_req(int fd, struct sip_msg *msg,
 	fd_set rset, wset, eset;
 	pv_value_t val;
 	int ret = RCL_INTERNAL_ERR, retr;
+	int stale_pool = 0;
 	CURLM *multi_handle;
 
-	LM_DBG("resume async processing...\n");
+	LM_DBG("resume async processing for call '%.*s' (timed_out=%d)\n",
+	        RCL_CALLID_LEN(msg), RCL_CALLID_S(msg), timed_out);
 
 	multi_handle = param->multi_list->multi_handle;
 
 	if (timed_out) {
-		char *url = NULL;
-		curl_easy_getinfo(param->handle, CURLINFO_EFFECTIVE_URL, &url);
-		LM_ERR("async %s timed out, URL: %s (timeout: %lds)\n",
-		        rest_client_method_str(param->method), url, param->timeout_s);
+		char *url = NULL, *primary_ip = NULL, *local_ip = NULL;
+		double total_time = 0, connect_time = 0, appconnect_time = 0,
+		       pretransfer_time = 0, starttransfer_time = 0;
+		curl_off_t size_up = -1, size_down = -1;
+		long os_errno = 0, num_connects = -1, resp_code = 0, primary_port = 0,
+		     local_port = 0;
+		int fd_valid;
+		struct timeval now_tv;
+		double wall_ms;
+
+ 		curl_easy_getinfo(param->handle, CURLINFO_EFFECTIVE_URL, &url);
+		curl_easy_getinfo(param->handle, CURLINFO_TOTAL_TIME, &total_time);
+		curl_easy_getinfo(param->handle, CURLINFO_CONNECT_TIME, &connect_time);
+		curl_easy_getinfo(param->handle, CURLINFO_APPCONNECT_TIME, &appconnect_time);
+		curl_easy_getinfo(param->handle, CURLINFO_PRETRANSFER_TIME, &pretransfer_time);
+		curl_easy_getinfo(param->handle, CURLINFO_STARTTRANSFER_TIME, &starttransfer_time);
+		curl_easy_getinfo(param->handle, CURLINFO_SIZE_UPLOAD_T, &size_up);
+		curl_easy_getinfo(param->handle, CURLINFO_SIZE_DOWNLOAD_T, &size_down);
+		curl_easy_getinfo(param->handle, CURLINFO_OS_ERRNO, &os_errno);
+		curl_easy_getinfo(param->handle, CURLINFO_NUM_CONNECTS, &num_connects);
+		curl_easy_getinfo(param->handle, CURLINFO_RESPONSE_CODE, &resp_code);
+		curl_easy_getinfo(param->handle, CURLINFO_PRIMARY_IP, &primary_ip);
+		curl_easy_getinfo(param->handle, CURLINFO_PRIMARY_PORT, &primary_port);
+		curl_easy_getinfo(param->handle, CURLINFO_LOCAL_IP, &local_ip);
+		curl_easy_getinfo(param->handle, CURLINFO_LOCAL_PORT, &local_port);
+		/* fd is the socket the reactor was watching; is it still open? */
+		fd_valid = (fd >= 0 && fcntl(fd, F_GETFD) != -1);
+
+		/* Real wall-clock elapsed since the async request started.  This is the
+		 * ONLY trustworthy "how long did this take" number: curl's CURLINFO_* clocks
+		 * (total/connect/pretransfer) only advance while curl is inside
+		 * curl_multi_perform, so a transfer that stalled after handoff shows
+		 * total~=0.003 even though ~1-2s of real time passed before the timer fired. */
+		gettimeofday(&now_tv, NULL);
+		wall_ms = (now_tv.tv_sec  - param->t_start.tv_sec)  * 1000.0
+		        + (now_tv.tv_usec - param->t_start.tv_usec) / 1000.0;
+
+		/* "stale pool reuse" bucket: curl was handed a pooled keep-alive socket
+		 * (no new connection: connect==0, num_connects==0) and never managed to
+		 * send anything (up==0) before the timer fired.  These reliably succeed on
+		 * retry, so give them a distinct return code (RCL_CONN_STALE) — same
+		 * handling, but the script can track or ignore them separately. */
+		stale_pool = (connect_time == 0.0 && num_connects == 0 && size_up == 0);
+
+		/* Evict the dead connection: the server closed it while idle, but curl
+		 * keeps it in the pool and would reuse it again -> the pool poisons with
+		 * CLOSE_WAIT sockets and every reuse fails.  FORBID_REUSE makes curl close
+		 * this connection when the handle is removed (in the 'out' path below)
+		 * instead of re-pooling it, so the pool refills with fresh, working conns.
+		 * Only on this failure bucket -> no effect on normal keep-alive operation. */
+		if (stale_pool)
+			curl_easy_setopt(param->handle, CURLOPT_FORBID_REUSE, 1L);
+
+		/* Rich diagnostics so we can tell WHERE the time went:
+		 *   connect=0            -> connection reused (no new TCP connect)
+		 *   connect>0,tls==0     -> stuck in/after TCP connect, before TLS
+		 *   tls>0,pretransfer==0 -> stuck after TLS, before sending the request
+		 *   pretransfer>0,start==0 -> request sent, no response byte yet (server slow/silent)
+		 *   start>0              -> response had begun; timed out mid-body
+		 * num_connects>1 / up>1207 indicate libcurl reconnected or re-sent. */
+		LM_WARN("async %s timed out for call '%.*s': bucket=%s rc=%d url=%s local=%s:%ld peer=%s:%ld "
+		        "fd=%d(valid=%d) timeout=%ldms wall=%.1fms elapsed[total=%.3f connect=%.3f tls=%.3f pretransfer=%.3f "
+		        "starttransfer=%.3f]s bytes[up=%" CURL_FORMAT_CURL_OFF_T " down=%"
+		        CURL_FORMAT_CURL_OFF_T "] http_code=%ld num_connects=%ld os_errno=%ld(%s)\n",
+		        rest_client_method_str(param->method), RCL_CALLID_LEN(msg), RCL_CALLID_S(msg),
+		        stale_pool ? "stale-pool-reuse" : "timeout", stale_pool ? RCL_CONN_STALE : RCL_TRANSFER_TIMEOUT,
+		        url ? url : "?", local_ip ? local_ip : "?", local_port,
+		        primary_ip ? primary_ip : "?", primary_port, fd, fd_valid,
+		        param->timeout_s, wall_ms, total_time, connect_time, appconnect_time, pretransfer_time,
+		        starttransfer_time, size_up, size_down, resp_code, num_connects,
+		        os_errno, os_errno ? strerror((int)os_errno) : "none");
+
+		/* Distinct callout: the reactor timer fired (timed_out=1) but curl's OWN
+		 * clock shows >= 1s of ACTIVE transfer time.  This is NOT the stale-pool
+		 * stall (where total~=0) — here curl was genuinely working the transfer for
+		 * over a second (slow/streaming response), so the request really was in
+		 * flight the whole time rather than parked on a dead socket. */
+		if (total_time >= 1.0)
+			LM_DBG("async %s call '%.*s': curl reports >=1s ACTIVE transfer (total=%.5fs, wall=%.1fms) "
+			        "on a timed-out request — genuine long transfer, not a stale-pool stall\n",
+			        rest_client_method_str(param->method), RCL_CALLID_LEN(msg), RCL_CALLID_S(msg),
+			        total_time, wall_ms);
 		goto cleanup;
 	}
 
@@ -1168,10 +1319,53 @@ cleanup:
 		ret = RCL_CONNECT_REFUSED;
 		goto out;
 
-	case CURLE_OPERATION_TIMEDOUT:
-		LM_ERR("connected, but transfer timed out (%lds)\n", curl_timeout);
+	case CURLE_OPERATION_TIMEDOUT: {
+		/* curl's own TIMEOUT_MS fired and surfaced via normal fd event (not the
+		 * reactor coarse timer).  This path produces -3 silently at LM_DBG, so
+		 * we emit the same rich diagnostics as the timed_out=1 path so both
+		 * timeout buckets are visible at WARN level. */
+		char *d_url = NULL, *d_pip = NULL, *d_lip = NULL;
+		double d_total = 0, d_conn = 0, d_tls = 0, d_pre = 0, d_start = 0;
+		curl_off_t d_up = -1, d_dn = -1;
+		long d_errno = 0, d_nconn = -1, d_pport = 0, d_lport = 0;
+		struct timeval d_now;
+		double d_wall;
+		int d_fdok;
+
+		curl_easy_getinfo(param->handle, CURLINFO_EFFECTIVE_URL,      &d_url);
+		curl_easy_getinfo(param->handle, CURLINFO_TOTAL_TIME,         &d_total);
+		curl_easy_getinfo(param->handle, CURLINFO_CONNECT_TIME,       &d_conn);
+		curl_easy_getinfo(param->handle, CURLINFO_APPCONNECT_TIME,    &d_tls);
+		curl_easy_getinfo(param->handle, CURLINFO_PRETRANSFER_TIME,   &d_pre);
+		curl_easy_getinfo(param->handle, CURLINFO_STARTTRANSFER_TIME, &d_start);
+		curl_easy_getinfo(param->handle, CURLINFO_SIZE_UPLOAD_T,      &d_up);
+		curl_easy_getinfo(param->handle, CURLINFO_SIZE_DOWNLOAD_T,    &d_dn);
+		curl_easy_getinfo(param->handle, CURLINFO_OS_ERRNO,           &d_errno);
+		curl_easy_getinfo(param->handle, CURLINFO_NUM_CONNECTS,       &d_nconn);
+		curl_easy_getinfo(param->handle, CURLINFO_PRIMARY_IP,         &d_pip);
+		curl_easy_getinfo(param->handle, CURLINFO_PRIMARY_PORT,       &d_pport);
+		curl_easy_getinfo(param->handle, CURLINFO_LOCAL_IP,           &d_lip);
+		curl_easy_getinfo(param->handle, CURLINFO_LOCAL_PORT,         &d_lport);
+		d_fdok = (fd >= 0 && fcntl(fd, F_GETFD) != -1);
+		gettimeofday(&d_now, NULL);
+		d_wall = (d_now.tv_sec  - param->t_start.tv_sec)  * 1000.0
+		       + (d_now.tv_usec - param->t_start.tv_usec) / 1000.0;
+
+		LM_DBG("async %s curl-timeout (active transfer) for call '%.*s': bucket=curl-timeout rc=%d "
+		        "url=%s local=%s:%ld peer=%s:%ld fd=%d(valid=%d) timeout=%ldms wall=%.1fms "
+		        "elapsed[total=%.3f connect=%.3f tls=%.3f pretransfer=%.3f starttransfer=%.3f]s "
+		        "bytes[up=%" CURL_FORMAT_CURL_OFF_T " down=%" CURL_FORMAT_CURL_OFF_T "] "
+		        "http_code=%ld num_connects=%ld os_errno=%ld(%s)\n",
+		        rest_client_method_str(param->method), RCL_CALLID_LEN(msg), RCL_CALLID_S(msg),
+		        RCL_TRANSFER_TIMEOUT, d_url ? d_url : "?",
+		        d_lip ? d_lip : "?", d_lport, d_pip ? d_pip : "?", d_pport,
+		        fd, d_fdok, param->timeout_s, d_wall,
+		        d_total, d_conn, d_tls, d_pre, d_start,
+		        d_up, d_dn, http_rc, d_nconn,
+		        d_errno, d_errno ? strerror((int)d_errno) : "none");
 		ret = RCL_TRANSFER_TIMEOUT;
 		break;
+	}
 
 	default:
 		LM_ERR("curl_easy_perform error %d, %s\n",
@@ -1214,7 +1408,7 @@ out:
 	pkg_free(param);
 
 	if (timed_out)
-		ret = RCL_TRANSFER_TIMEOUT;
+		ret = stale_pool ? RCL_CONN_STALE : RCL_TRANSFER_TIMEOUT;
 
 	/* default async status is ASYNC_DONE */
 	return ret;

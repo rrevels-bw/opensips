@@ -25,6 +25,12 @@
 #ifndef _REST_METHODS_
 #define _REST_METHODS_
 
+#include <sys/time.h>
+
+/* Safe call-ID accessors: msg or msg->callid may be NULL in event/timer routes */
+#define RCL_CALLID_LEN(_m) (((_m) && (_m)->callid) ? (_m)->callid->body.len : 1)
+#define RCL_CALLID_S(_m)   (((_m) && (_m)->callid) ? (_m)->callid->body.s   : "-")
+
 #include "../../pvar.h"
 #include "../../dprint.h"
 #include "../../error.h"
@@ -69,6 +75,7 @@ enum rest_client_method {
 #define RCL_CONNECT_TIMEOUT     -2
 #define RCL_TRANSFER_TIMEOUT    -3
 #define RCL_ALREADY_CONNECTING  -4
+#define RCL_CONN_STALE          -5  /* async timeout on a reused pool conn before anything was sent (dead keep-alive); retryable */
 #define RCL_INTERNAL_ERR       -10
 
 typedef struct _rest_trace_param {
@@ -116,6 +123,7 @@ typedef struct rest_async_param_ {
 	str body;
 	str ctype;
 	unsigned long timeout_s; /* max possible duration for the entire cURL op */
+	struct timeval t_start;  /* wall-clock start of the async request (real elapsed) */
 
 	rest_trace_param_t* tparam;
 
